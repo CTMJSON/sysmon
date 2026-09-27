@@ -754,6 +754,452 @@ function vendorFor(mac) {
 }
 
 /* ------------------------------------------------------------------ */
+/* power & battery (pmset + ioreg)                                     */
+/* ------------------------------------------------------------------ */
+
+let energyCache = { at: 0, data: null };
+
+function parsePowerSource(out) {
+  const src = out.match(/Now drawing from '([^']+)'/);
+  const source = src ? (src[1].toLowerCase().includes('ac') ? 'AC' : 'Battery') : null;
+  const pct = out.match(/(\d+)%/);
+  const state = out.match(/;\s*(\w+);/);
+  const rem = out.match(/(\d+):(\d+)\s+remaining/);
+  return {
+    source,
+    percent: pct ? num(pct[1]) : null,
+    state: state ? state[1].toLowerCase() : null,
+    remainingMinutes: rem ? num(rem[1]) * 60 + num(rem[2]) : null,
+  };
+}
+
+function parseThermal(out) {
+  const pick = (label) => {
+    const line = out.split('\n').find((l) => l.includes(label));
+    if (!line) return null;
+    if (line.includes('No ') && line.includes(' recorded')) return 'none';
+    const m = line.match(/:?\s*([A-Za-z_][^]*)$/);
+    return m ? m[1].trim() : 'unknown';
+  };
+  return {
+    thermal: pick('thermal warning level'),
+    performance: pick('performance warning level'),
+    cpuPower: pick('CPU power status'),
+  };
+}
+
+function parseSmartBattery(out) {
+  const kv = {};
+  for (const m of out.matchAll(/^[ \t]*"(\w+)"\s*=\s*([^\n]+)/gm)) {
+    const v = m[2].trim();
+    if (v === 'Yes') kv[m[1]] = true;
+    else if (v === 'No') kv[m[1]] = false;
+    else if (!isNaN(Number(v)) && !/^[<{]/.test(v)) kv[m[1]] = Number(v);
+    else kv[m[1]] = v;
+  }
+  return kv;
+}
+
+async function collectEnergy() {
+  const now = Date.now();
+  if (energyCache.data && now - energyCache.at < 30000) return energyCache.data;
+  // never prompt for a password — only use powermetrics when passwordless
+  // sudo already works, otherwise degrade to "unavailable" with a reason.
+  const probe = await run('sh', ['-c', 'sudo -n true 2>/dev/null && echo SUDO_OK'], 3000);
+  if (!probe.includes('SUDO_OK')) {
+    energyCache = { at: now, data: { available: false, reason: 'requires passwordless sudo' } };
+    return energyCache.data;
+  }
+  const out = await run(
+    'sudo',
+    ['-n', 'powermetrics', '-n', '1', '-i', '100', '--samplers', 'cpu_power,gpu_power,thermal', '-f', 'text'],
+    8000
+  );
+  const data = {
+    available: true,
+    cpu: (out.match(/CPU Power:\s*([\d.]+)\s*mW/) || [])[1] != null ? num(out.match(/CPU Power:\s*([\d.]+)\s*mW/)[1]) : null,
+    gpu: (out.match(/GPU Power:\s*([\d.]+)\s*mW/) || [])[1] != null ? num(out.match(/GPU Power:\s*([\d.]+)\s*mW/)[1]) : null,
+    cpuTempC: (out.match(/CPU die temperature:\s*([\d.]+)/) || [])[1] != null ? num(out.match(/CPU die temperature:\s*([\d.]+)/)[1]) : null,
+    gpuTempC: (out.match(/GPU die temperature:\s*([\d.]+)/) || [])[1] != null ? num(out.match(/GPU die temperature:\s*([\d.]+)/)[1]) : null,
+  };
+  energyCache = { at: now, data };
+  return data;
+}
+
+async function collectPower() {
+  const [battOut, thermOut, ioregOut] = await Promise.all([
+    run('pmset', ['-g', 'batt'], 4000),
+    run('pmset', ['-g', 'therm'], 4000),
+    run('ioreg', ['-rn', 'AppleSmartBattery'], 4000),
+  ]);
+
+  const b = parsePowerSource(battOut);
+  const therm = parseThermal(thermOut);
+  const kv = ioregOut.trim() ? parseSmartBattery(ioregOut) : null;
+
+  const battery = kv
+    ? {
+        present: true,
+        percent: kv.CurrentCapacity != null ? kv.CurrentCapacity : b.percent,
+        designCapacityMah: kv.DesignCapacity != null ? kv.DesignCapacity : null,
+        maxCapacityMah: kv.NominalChargeCapacity != null ? kv.NominalChargeCapacity : kv.MaxCapacity != null ? kv.MaxCapacity : null,
+        // NominalChargeCapacity is the current full-charge capacity in mAh;
+        // MaxCapacity is percent-scale and must not be used for health.
+        healthPercent: kv.DesignCapacity && kv.NominalChargeCapacity != null
+          ? +((kv.NominalChargeCapacity / kv.DesignCapacity) * 100).toFixed(1)
+          : null,
+        cycleCount: kv.CycleCount != null ? kv.CycleCount : null,
+        // ioreg reports deci-Kelvin; convert to °C
+        temperatureC: kv.Temperature != null ? +((kv.Temperature - 2731.5) / 10).toFixed(1) : null,
+        voltageMv: kv.Voltage != null ? kv.Voltage : null,
+        amperageMa: kv.Amperage != null ? Number(BigInt.asIntN(64, BigInt(kv.Amperage))) : null,
+        isCharging: !!kv.IsCharging,
+        externalConnected: !!kv.ExternalConnected,
+        fullyCharged: !!kv.FullyCharged,
+        // ioreg TimeRemaining is in minutes on current macOS
+        timeRemaining: kv.TimeRemaining != null ? kv.TimeRemaining : b.remainingMinutes,
+      }
+    : null;
+
+  return {
+    available: true,
+    at: Date.now(),
+    source: b.source,
+    battery,
+    thermal: therm,
+    energy: await collectEnergy(),
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* disk health / S.M.A.R.T. (diskutil)                                 */
+/* ------------------------------------------------------------------ */
+
+let diskCache = { at: 0, data: null };
+
+async function collectDiskHealth() {
+  const now = Date.now();
+  if (diskCache.data && now - diskCache.at < 15000) return diskCache.data;
+
+  const list = await run('diskutil', ['list'], 6000);
+  const physical = [];
+  for (const line of list.split('\n')) {
+    const m = line.match(/^\/dev\/(disk\d+)\s+\((internal|external), physical\):/);
+    if (m) physical.push({ id: m[1], kind: m[2] });
+  }
+
+  const disks = [];
+  for (const d of physical) {
+    const info = await run('diskutil', ['info', d.id], 6000);
+    const grab = (re) => {
+      const m = info.match(re);
+      return m ? m[1].trim() : null;
+    };
+    const sizeMatch = info.match(/Disk Size:\s*([\d.]+)\s*(\w+)/);
+    disks.push({
+      id: d.id,
+      kind: d.kind,
+      name: grab(/Device \/ Media Name:\s*(.+)/),
+      protocol: grab(/Protocol:\s*(.+)/),
+      smart: grab(/SMART Status:\s*(.+)/),
+      size: sizeMatch ? { value: num(sizeMatch[1]), unit: sizeMatch[2] } : null,
+    });
+  }
+
+  const data = {
+    available: true,
+    at: Date.now(),
+    disks,
+    failing: disks.filter((x) => /fail/i.test(x.smart || '')).length,
+  };
+  diskCache = { at: Date.now(), data };
+  return data;
+}
+
+/* ------------------------------------------------------------------ */
+/* open file descriptors (sysctl)                                      */
+/* ------------------------------------------------------------------ */
+
+async function collectFds() {
+  const out = await run('sysctl', ['-n', 'kern.num_files', 'kern.maxfiles', 'kern.maxfilesperproc'], 3000);
+  const [open, max, maxPerProc] = out.trim().split('\n').map((s) => num(s));
+  return {
+    open,
+    max,
+    maxPerProc,
+    percent: max ? +((open / max) * 100).toFixed(1) : 0,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* network reliability — packet-level errors (netstat -s)              */
+/* ------------------------------------------------------------------ */
+
+let lastNetErr = null;
+
+function countersToObj(out, map) {
+  const res = {};
+  for (const [key, re] of Object.entries(map)) {
+    const m = out.match(re);
+    res[key] = m ? num(m[1]) : 0;
+  }
+  return res;
+}
+
+async function collectNetErrors() {
+  const [tcp, udp] = await Promise.all([
+    run('netstat', ['-s', '-p', 'tcp'], 6000),
+    run('netstat', ['-s', '-p', 'udp'], 6000),
+  ]);
+  const t = countersToObj(tcp, {
+    retransmitTimeouts: /^[ \t]*(\d+)[ \t]+retransmit timeout/m,
+    retransmittedSegments: /^[ \t]*(\d+)[ \t]+segment retransmitted(?! in)/m,
+    outOfOrder: /^[ \t]*(\d+)[ \t]+out-of-order packet/m,
+    badChecksum: /^[ \t]*(\d+)[ \t]+discarded for bad checksum/m,
+    listenOverflow: /^[ \t]*(\d+)[ \t]+listen queue overflow/m,
+    badConnectionAttempts: /^[ \t]*(\d+)[ \t]+bad connection attempt/m,
+  });
+  const u = countersToObj(udp, {
+    received: /^[ \t]*(\d+)[ \t]+datagrams received/m,
+    sent: /^[ \t]*(\d+)[ \t]+datagrams output/m,
+    badChecksum: /^[ \t]*(\d+)[ \t]+with bad checksum/m,
+    noSocket: /^[ \t]*(\d+)[ \t]+dropped due to no socket/m,
+    fullBuffers: /^[ \t]*(\d+)[ \t]+dropped due to full socket buffers/m,
+  });
+
+  const totals = { tcp: t, udp: u };
+  let delta = null;
+  if (lastNetErr) {
+    const dd = (cur, prev) => Math.max(0, cur - prev);
+    delta = {
+      retransmitTimeouts: dd(t.retransmitTimeouts, lastNetErr.totals.tcp.retransmitTimeouts),
+      retransmittedSegments: dd(t.retransmittedSegments, lastNetErr.totals.tcp.retransmittedSegments),
+      outOfOrder: dd(t.outOfOrder, lastNetErr.totals.tcp.outOfOrder),
+      tcpBadChecksum: dd(t.badChecksum, lastNetErr.totals.tcp.badChecksum),
+      udpBadChecksum: dd(u.badChecksum, lastNetErr.totals.udp.badChecksum),
+      noSocket: dd(u.noSocket, lastNetErr.totals.udp.noSocket),
+      fullBuffers: dd(u.fullBuffers, lastNetErr.totals.udp.fullBuffers),
+      listenOverflow: dd(t.listenOverflow, lastNetErr.totals.tcp.listenOverflow),
+    };
+  }
+  lastNetErr = { totals };
+  return { available: true, at: Date.now(), totals, delta };
+}
+
+/* ------------------------------------------------------------------ */
+/* per-app network usage (nettop)                                      */
+/* ------------------------------------------------------------------ */
+
+let lastAppNet = null;
+
+async function collectAppNet() {
+  const out = await run('nettop', ['-P', '-L', '1', '-J', 'bytes_in,bytes_out,interface,state'], 8000);
+  const now = Date.now();
+  const prevData = lastAppNet ? lastAppNet.data : {};
+  const data = {};
+  const apps = [];
+
+  for (const line of out.split('\n')) {
+    if (!line.trim() || line.startsWith(',')) continue;
+    const cols = line.split(',');
+    if (cols.length < 5) continue;
+    const name = cols[0].trim();
+    if (!name || !name.includes('.')) continue;
+    const [proc, pid] = name.split(/\.(?=\d+$)/);
+    const ib = num(cols[3]);
+    const ob = num(cols[4]);
+    if (!proc || (ib === 0 && ob === 0)) continue;
+    const prev = prevData[name];
+    const dt = prev ? (now - prev.at) / 1000 : 0;
+    let rx = 0;
+    let tx = 0;
+    if (prev && dt > 0.05) {
+      rx = Math.max(0, (ib - prev.ibytes) / dt);
+      tx = Math.max(0, (ob - prev.obytes) / dt);
+    }
+    data[name] = { ibytes: ib, obytes: ob, at: now };
+    apps.push({ name: proc, pid: num(pid), rx, tx, rxTotal: ib, txTotal: ob });
+  }
+
+  lastAppNet = { at: now, data };
+  const list = apps.sort((a, b) => (b.rx + b.tx) - (a.rx + a.tx)).slice(0, 10);
+  return {
+    available: true,
+    at: now,
+    totalRx: list.reduce((a, b) => a + b.rx, 0),
+    totalTx: list.reduce((a, b) => a + b.tx, 0),
+    apps: list,
+  };
+}
+
+/* ------------------------------------------------------------------ */
+/* local service discovery (dns-sd / Bonjour)                          */
+/* ------------------------------------------------------------------ */
+
+let serviceCache = { at: 0, data: null, building: false };
+const SERVICES_TTL = 90000; // full mDNS sweep is expensive; cache it
+
+const SERVICE_FRIENDLY = {
+  '_airplay': 'AirPlay', '_raop': 'AirPlay Receiver', '_companion-link': 'HomeKit',
+  '_http': 'Web Server', '_googlecast': 'Chromecast', '_spotify-connect': 'Spotify',
+  '_ssh': 'SSH', '_smb': 'File Sharing (SMB)', '_afpovertcp': 'File Sharing (AFP)',
+  '_printer': 'AirPrint Printer', '_scanner': 'Scanner', '_rfb': 'Screen Sharing',
+  '_homekit': 'HomeKit Accessory', '_ipps': 'Printer (IPP)', '_ipp': 'Printer (IPP)',
+  '_sleep-proxy': 'Wake on Demand', '_airport': 'AirPort', '_dns-sd': 'Bonjour',
+  '_openclaw-gw': 'OpenClaw Gateway', '_asquic': 'Audio/Video (QUIC)',
+};
+
+// run fn over items with bounded concurrency, preserving order
+async function mapConcurrent(items, concurrency, fn) {
+  const results = new Array(items.length);
+  let idx = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
+    while (idx < items.length) {
+      const i = idx++;
+      results[i] = await fn(items[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
+// dns-sd streams forever; run() kills it at the timeout and keeps the partial
+// stdout we collected — replies for cached services arrive within ~100ms, so
+// the kill timeout is the real per-call cost, not the data.
+async function dnsBrowseType(type) {
+  const out = await run('dns-sd', ['-B', type, 'local'], 1400);
+  const instances = [];
+  const seen = new Set();
+  for (const line of out.split('\n')) {
+    const m = line.match(/Add\s+.*?\.\s+(_[\w-]+)\.(_tcp|_udp)\.\s+(.+)$/);
+    if (!m || `${m[1]}.${m[2]}` !== type) continue;
+    const name = m[3].trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    instances.push(name);
+  }
+  return instances;
+}
+
+async function dnsLookup(instance, type) {
+  const out = await run('dns-sd', ['-L', instance, type, 'local'], 1200);
+  const reach = out.match(/can be reached at (\S+?):(\d+)(?: \(interface (\d+)\))?/);
+  if (!reach) return null;
+  const txt = {};
+  for (const tok of out.split(/\s+/)) {
+    const kv = tok.match(/^([\w-]+)=(.+)$/);
+    if (kv && kv[1].toLowerCase() !== 'txtvers') txt[kv[1].toLowerCase()] = kv[2];
+  }
+  return {
+    host: reach[1].replace(/\.$/, ''),
+    port: num(reach[2]),
+    interface: reach[3] ? num(reach[3]) : null,
+    txt,
+  };
+}
+
+async function dnsResolve(host) {
+  const out = await run('dns-sd', ['-G', 'v4v6', host], 1000);
+  const ips = [];
+  for (const line of out.split('\n')) {
+    if (!/\bAdd\s/.test(line)) continue;   // lines start with a timestamp column
+    const parts = line.trim().split(/\s+/);
+    if (parts.length < 6) continue;
+    const ip = parts[5];   // 0=ts 1=Add 2=flags 3=IF 4=host 5=address 6=TTL
+    if (parts.includes('No')) continue;            // "No Such Record" (e.g. no AAAA)
+    if (/^0+$/.test(ip) || /^([0:]+%?<.*>?)?$/.test(ip)) continue; // empty/zero v6
+    if (ip.startsWith('127.')) continue;           // loopback
+    const g = ip.replace(/%\S+$/, '').split(':');
+    if (g.length === 8 && g.slice(0, 7).every((x) => /^0*$/.test(x)) && /^0*1$/.test(g[7])) continue; // ::1
+    if (!ips.includes(ip)) ips.push(ip);
+  }
+  return ips;
+}
+
+async function sweepServices() {
+  const t0 = Date.now();
+
+  // 1) what service types are advertising?
+  const out = await run('dns-sd', ['-B', '_services._dns-sd._udp', 'local'], 2200);
+  const counts = {};
+  for (const line of out.split('\n')) {
+    // browse lines: "Add  <nr> <nr> .  <_tcp|_udp>.local.  <type>" — the actual
+    // service type sits in the instance-name column; the transport is in the
+    // service-type column. Match leniently across the numeric/flag fields.
+    const m = line.match(/Add\s+[^.\n]*\.\s+(_tcp|_udp)\.local\.\s+(_[\w-]+)/);
+    if (!m) continue;
+    const type = `${m[2]}.${m[1]}`;
+    counts[type] = (counts[type] || 0) + 1;
+  }
+  const types = Object.keys(counts).sort((a, b) => counts[b] - counts[a]).slice(0, 12);
+
+  // 2) which instances per type? (parallel, bounded)
+  const typeResults = await mapConcurrent(types, 6, async (type) => ({
+    type,
+    instances: (await dnsBrowseType(type)).slice(0, 6),
+  }));
+
+  // 3) resolve host:port + TXT for each instance (parallel, bounded)
+  const lookups = [];
+  for (const r of typeResults) for (const name of r.instances) lookups.push({ type: r.type, name });
+  const lookupResults = await mapConcurrent(lookups.slice(0, 30), 10, async ({ type, name }) => {
+    const info = await dnsLookup(name, type);
+    return { type, name, info };
+  });
+
+  const byType = new Map();
+  for (const { type, name, info } of lookupResults) {
+    if (!info) continue;
+    if (!byType.has(type)) byType.set(type, []);
+    byType.get(type).push({ name, ...info });
+  }
+
+  // 4) resolve distinct hostnames to IPs (parallel, bounded)
+  const hosts = [...new Set([...byType.values()].flat().map((i) => i.host))].slice(0, 24);
+  const hostIps = {};
+  const hostRes = await mapConcurrent(hosts, 10, async (host) => ({ host, ips: await dnsResolve(host) }));
+  for (const { host, ips } of hostRes) hostIps[host] = ips;
+
+  const services = types
+    .map((type) => {
+      const base = type.split('.')[0];
+      return {
+        type,
+        name: SERVICE_FRIENDLY[base] || base.replace(/^_/, ''),
+        count: counts[type],
+        instances: (byType.get(type) || []).map((i) => ({ ...i, ips: hostIps[i.host] || [] })),
+      };
+    })
+    .sort((a, b) => b.count - a.count || a.type.localeCompare(b.type));
+
+  return {
+    available: out.includes('Browsing for') || services.length > 0,
+    at: Date.now(),
+    sweepMs: Date.now() - t0,
+    hostname: os.hostname(),
+    count: services.length,
+    services,
+  };
+}
+
+async function collectServices() {
+  const now = Date.now();
+  if (serviceCache.data && now - serviceCache.at < SERVICES_TTL) return serviceCache.data;
+  if (serviceCache.building) return serviceCache.data || { available: true, building: true, count: 0, services: [] };
+  serviceCache.building = true;
+  try {
+    serviceCache.data = await sweepServices();
+    serviceCache.at = Date.now();
+  } catch (e) {
+    if (!serviceCache.data) serviceCache.data = { available: false, count: 0, services: [] };
+    serviceCache.at = Date.now();
+  } finally {
+    serviceCache.building = false;
+  }
+  return serviceCache.data;
+}
+
+/* ------------------------------------------------------------------ */
 /* snapshot aggregation                                               */
 /* ------------------------------------------------------------------ */
 
@@ -822,6 +1268,12 @@ const routes = {
   '/api/ports': collectPorts,
   '/api/processes': collectProcesses,
   '/api/devices': () => collectDevices(true),
+  '/api/power': collectPower,
+  '/api/smart': collectDiskHealth,
+  '/api/fds': collectFds,
+  '/api/neterr': collectNetErrors,
+  '/api/appnet': collectAppNet,
+  '/api/services': collectServices,
   '/api/health': async () => ({ ok: true, uptime: (Date.now() - startedAt) / 1000, pid: process.pid }),
 };
 

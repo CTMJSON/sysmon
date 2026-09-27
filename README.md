@@ -4,7 +4,8 @@ A lightweight local system monitor. Type `system` in the terminal and the
 dashboard opens in a new Chrome tab on `http://127.0.0.1:7717`.
 
 No dependencies — plain Node + the native macOS tools (`vm_stat`, `df`,
-`netstat`, `lsof`, `ps`, `arp`, `ping`, `ifconfig`, `sysctl`, `route`).
+`netstat`, `lsof`, `ps`, `arp`, `ping`, `ifconfig`, `sysctl`, `route`,
+`pmset`, `ioreg`, `diskutil`, `nettop`, `dns-sd`).
 
 ## Usage
 
@@ -37,9 +38,17 @@ Logs go to `/tmp/sysmon.log`.
 | **Listening ports** — TCP + bound UDP with owning process and PID | `netstat -anv -p tcp`, `lsof` |
 | **Processes** — top CPU / top memory, RSS | `ps -axo ... -r` |
 | **System** — host, model, chip, OS, uptime, boot time | `sysctl`, `os` |
+| **Power & Battery** — charge %, state, time remaining, health, cycle count, battery temp, thermal throttling | `pmset -g batt`, `pmset -g therm`, `ioreg -rn AppleSmartBattery` |
+| **Open Files** — open descriptors vs kernel limit | `sysctl kern.num_files` |
+| **Disk Health (S.M.A.R.T.)** — per-physical-disk self-test verdict | `diskutil list`, `diskutil info` |
+| **Network Reliability** — retransmits, out-of-order, bad checksums, UDP drops | `netstat -s` |
+| **Per-App Network** — top processes by live ↓/↑ rate | `nettop` |
+| **Local Services (Bonjour)** — mDNS types + per-instance device, host:port, TXT (model/vendor/MAC), IP | `dns-sd -B/-L/-G` |
 
-Live panels refresh every 2s. The network sweep and port/process inventory
-refresh every 20s (a /24 sweep is deliberately paced so it stays cheap).
+Live panels refresh every 2s. The network sweep, port/process inventory,
+S.M.A.R.T., packet-error counters, per-app network, and Bonjour browse refresh
+every 20s (a /24 sweep is deliberately paced so it stays cheap; nettop and
+dns-sd each take a few seconds to sample, so they run slowly).
 
 ## Notes on how the numbers are derived
 
@@ -59,6 +68,33 @@ refresh every 20s (a /24 sweep is deliberately paced so it stays cheap).
 - **Ports** show listeners and bound UDP sockets. macOS reports kernel-owned
   sockets without a process name; those appear as `unknown` where no owner is
   visible.
+- **Battery health** is current full-charge capacity ÷ design capacity
+  (`NominalChargeCapacity / DesignCapacity` from `ioreg`). Battery temperature
+  is reported by the battery's own sensor (deci-Kelvin converted to °C). On a
+  desktop with no battery the panel shows the power source only.
+- **Disk Health** reports the S.M.A.R.T. self-test verdict from `diskutil`.
+  `Verified` = healthy, `Failing` = back up now, `Not Supported` = the drive
+  (typically external/USB) doesn't expose S.M.A.R.T. Attribute detail like
+  reallocated-sector counts is **not** exposed by macOS; that would need
+  `smartmontools` (brew) and is deliberately out of scope.
+- **Open Files** is the system-wide descriptor count vs `kern.maxfiles`. Above
+  90% is treated as critical — a leak in one app can exhaust the shared limit.
+- **Per-App Network** rates are the delta between 20s samples of `nettop`
+  cumulative counters. The first sample after the dashboard loads has no
+  baseline, so it shows 0 until the next poll. Processes that exit between
+  polls lose their totals.
+- **Network Reliability** numbers are boot-cumulative from `netstat -s`; the
+  "now" column is the delta since the last 20s sample.
+- **Local Services** is a best-effort mDNS browse: devices on other subnets or
+  with mDNS disabled won't appear. It lists service *types* (with counts) and
+  drills each into individual instances via `dns-sd -B`/`-L`/`-G` — device
+  name, host:port, key TXT fields (model, vendor, MAC, firmware), and resolved
+  IPs. The full sweep spawns a bounded set of concurrent `dns-sd` processes
+  (~8s) and is cached for 90s; the panel only re-scans on that cadence.
+- **GPU / CPU power** (`powermetrics`) only appears when passwordless sudo is
+  configured (`sudo -n true` succeeds) — otherwise the energy section reports
+  `unavailable` instead of prompting. Nothing in sysmon ever prompts for a
+  password.
 
 ## Layout
 
@@ -66,6 +102,8 @@ refresh every 20s (a /24 sweep is deliberately paced so it stays cheap).
 sysmon/
 ├── server.js        # collector + HTTP server (no deps)
 ├── system           # launcher: starts server, opens the tab
+├── research/
+│   └── candidate-tools.md   # surveyed tools, priorities, risks
 └── public/
     └── index.html   # dashboard (vanilla JS, no build step)
 ```
@@ -82,6 +120,12 @@ GET /api/speed       speed test (~20s)
 GET /api/ports       listening sockets
 GET /api/processes   process list
 GET /api/devices     LAN device sweep
+GET /api/power       battery, thermal, GPU/CPU power
+GET /api/smart       per-disk S.M.A.R.T. status
+GET /api/fds         open file descriptors
+GET /api/neterr      packet-error counters (TCP/UDP)
+GET /api/appnet      per-process network rates
+GET /api/services    Bonjour service types + instances (90s cache)
 GET /api/health      liveness
 ```
 
