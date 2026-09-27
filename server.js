@@ -15,12 +15,25 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { URL } = require('url');
+const zlib = require('zlib');
 
 const PORT = Number(process.env.SYSMON_PORT || 7717);
 const HOST = '127.0.0.1';
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const startedAt = Date.now();
+
+/* ------------------------------------------------------------------ */
+/* OUI vendor database (bundled, from the Wireshark `manuf` data)      */
+/* ------------------------------------------------------------------ */
+
+let OUI = {};
+try {
+  const gz = fs.readFileSync(path.join(__dirname, 'data', 'oui.json.gz'));
+  OUI = JSON.parse(zlib.gunzipSync(gz).toString('utf8'));
+} catch (e) {
+  OUI = {};
+}
 
 /* ------------------------------------------------------------------ */
 /* shell helpers                                                       */
@@ -30,6 +43,16 @@ function run(cmd, args = [], timeout = 5000) {
   return new Promise((resolve) => {
     execFile(cmd, args, { timeout, maxBuffer: 12 * 1024 * 1024 }, (err, stdout) => {
       resolve(err && !stdout ? '' : String(stdout || ''));
+    });
+  });
+}
+
+// like run() but reports the exit status — needed when a tool signals success
+// only via its exit code (nc -z writes its banner to stderr, not stdout).
+function runExit(cmd, args = [], timeout = 5000) {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout, maxBuffer: 12 * 1024 * 1024 }, (err) => {
+      resolve({ ok: !err });
     });
   });
 }
@@ -640,8 +663,183 @@ function parseArp(out, map) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* device intel — Bonjour join, port fingerprint, SMB hostname/OS      */
+/* (all native / open-source, no sudo)                                 */
+/* ------------------------------------------------------------------ */
+
+const PORT_HINTS = [
+  [22, 'SSH'], [53, 'DNS'], [80, 'HTTP'], [443, 'HTTPS'], [139, 'NetBIOS'], [445, 'SMB'],
+  [515, 'LPD'], [631, 'IPP'], [9100, 'Raw print'], [8060, 'Roku'], [7000, 'AirPlay'],
+  [62078, 'iPhone sync'], [32400, 'Plex'], [3389, 'RDP'], [8080, 'HTTP alt'],
+];
+
+function guessType(ports, vendor) {
+  const has = (p) => ports.some((x) => x.port === p);
+  if (has(8060)) return 'Media player (Roku)';
+  if (has(631) || has(515) || has(9100)) return 'Printer';
+  if (has(445) || has(139)) return 'File share / NAS';
+  if (has(3389)) return 'Windows (RDP)';
+  if (has(32400)) return 'Media server (Plex)';
+  if (has(53) && (has(80) || has(443))) return 'Router / gateway';
+  if (has(80) && has(443)) return 'Web-admin device';
+  if (has(80) || has(443) || has(8080)) return 'Web device / IoT';
+  if (has(22)) return 'SSH host';
+  if (has(7000) || has(62078)) return 'Apple device';
+  return '';
+}
+
+async function probePorts(ip) {
+  const results = await Promise.all(
+    PORT_HINTS.map(async ([port, name]) => {
+      const r = await runExit('nc', ['-z', '-G', '1', '-w', '1', ip, String(port)], 1500);
+      return r.ok ? { port, name } : null;
+    })
+  );
+  return results.filter(Boolean);
+}
+
+async function probeSmb(ip) {
+  const out = await run('smbutil', ['status', ip], 3500);
+  if (!out.trim()) return null;
+  const g = (re) => { const m = out.match(re); return m ? m[1].trim() : null; };
+  return {
+    name: g(/Server:\s*(.+)/),
+    os: g(/OS:\s*(.+)/),
+    comment: g(/Comment:\s*(.+)/),
+  };
+}
+
+const enrichCache = new Map();
+const enrichInflight = new Set();
+const ENRICH_TTL = 30 * 60 * 1000; // re-probe once per 30 min at most
+
+async function enrichUnknown(list) {
+  const candidates = list
+    .filter((d) => {
+      if (d.isGateway || d.isSelf) return false;
+      if (d.name && d.name !== 'Unknown device' && d.name !== d.vendor && d.type) return false;
+      const e = enrichCache.get(d.ip);
+      if (e && Date.now() - e.at < ENRICH_TTL) return false;
+      return !enrichInflight.has(d.ip);
+    })
+    .slice(0, 6);
+  if (!candidates.length) return;
+  for (const d of candidates) enrichInflight.add(d.ip);
+  try {
+    await mapConcurrent(candidates, 6, async (d) => {
+      const ports = await probePorts(d.ip);
+      let smb = null;
+      if (ports.some((p) => p.port === 445)) smb = await probeSmb(d.ip);
+      enrichCache.set(d.ip, { at: Date.now(), ports, type: guessType(ports), smb });
+    });
+  } finally {
+    for (const d of candidates) enrichInflight.delete(d.ip);
+  }
+}
+
+function buildBonjourIndex() {
+  const svc = serviceCache.data;
+  if (svc && svc.services) {
+    for (const s of svc.services) {
+      for (const inst of s.instances || []) {
+        for (const ip of inst.ips || []) {
+          if (ip.includes(':')) continue; // devices panel is IPv4 (link-local v6 is noise)
+          const cand = {
+            name: inst.name,
+            host: inst.host,
+            mac: macFromName(inst.name),
+            model: inst.txt && inst.txt.model,
+            manufacturer: inst.txt && inst.txt.manufacturer,
+            service: s.name,
+          };
+          const prev = bonjourNames.get(ip);
+          if (!prev || nameScore(cand) > nameScore(prev)) {
+            bonjourNames.set(ip, cand);
+            persistBonjour();
+          }
+        }
+      }
+    }
+  }
+  return bonjourNames;
+}
+
+// Bonjour instance names are sometimes auto-generated hashes/UUIDs that aren't
+// human labels (Google Home, Vizio TVs, Amazon DMGR ids). Return a nicer label
+// or null when the raw name is not worth showing.
+function cleanInstanceName(name, service) {
+  if (!name) return null;
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(name)) return null;
+  if (/^[0-9a-f]{16,40}$/i.test(name)) return null;               // bare hex hash
+  if (/^amzn\./i.test(name)) return 'Amazon Echo';
+  name = name.replace(/ \[[0-9a-f:]{17}\]$/i, '');                // "host [aa:bb:..:ff]"
+  const stripped = name.replace(/[-_][0-9a-f]{16,}$/i, '');
+  if (stripped && stripped.length >= 2) return stripped;
+  return name;
+}
+
+// some Bonjour names embed the MAC in brackets, e.g. "jgpt [b8:27:eb:61:3e:2d]" —
+// this recovers it so the OUI vendor lookup works even when the ARP cache is empty.
+function macFromName(name) {
+  if (!name) return null;
+  const m = name.match(/\[([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\]/);
+  return m ? padMac(m[1].toLowerCase()) : null;
+}
+
+// generic service-token names (e.g. a Vizio TV's googlerpc instance) that are
+// worse labels than a model-ish name from another service on the same IP.
+const GENERIC_BONJOUR_NAMES = new Set([
+  'googlerpc', 'googlezone', 'googlecast', 'amzn-wplay', 'asquic', 'matterd',
+  'bonjour', 'workstation', 'sleep-proxy', 'dns-sd', 'homekit', 'hap',
+  'spotify-connect', 'spotify-ln-check', 'spotify-social-listening', 'openclaw-gw',
+]);
+
+function nameScore(e) {
+  const c = cleanInstanceName(e && e.name);
+  let s = 0;
+  if (!c) s = 1;
+  else if (GENERIC_BONJOUR_NAMES.has(String(c).toLowerCase())) s = 2;
+  else s = 3;
+  if (e && e.model) s += 0.5;
+  return s;
+}
+
+// persistent per-IP name index — mDNS is dynamic and sweeps vary, so keep the
+// best human-readable name we've ever seen for an IP, and survive restarts.
+const BONJOUR_CACHE = path.join(os.tmpdir(), 'sysmon-bonjour.json');
+let bonjourNames = new Map();
+try {
+  const raw = JSON.parse(fs.readFileSync(BONJOUR_CACHE, 'utf8'));
+  for (const [ip, e] of Object.entries(raw)) bonjourNames.set(ip, e);
+} catch (e) { /* first run */ }
+
+let bonjourSaveTimer = null;
+function persistBonjour() {
+  if (bonjourSaveTimer) return;
+  bonjourSaveTimer = setTimeout(() => {
+    bonjourSaveTimer = null;
+    try { fs.writeFileSync(BONJOUR_CACHE, JSON.stringify(Object.fromEntries(bonjourNames))); } catch (e) {}
+  }, 3000);
+}
+
+// generic fallback names for well-known services when a device hides its name
+const SERVICE_GENERIC_NAMES = {
+  'Chromecast': 'Google Cast device',
+  'googcrossdevice': 'Google Home / Cast',
+  'googlecast': 'Google Cast device',
+  'googlezone': 'Google device',
+  'googlerpc': 'Google device',
+  'AirPlay': 'Apple device',
+  'AirPlay Receiver': 'Apple device',
+  'Spotify': 'Spotify device',
+  'File Sharing (SMB)': 'NAS / file share',
+  'Web Server': 'Web server',
+};
+
 async function collectDevices(sweep = true) {
-  const ifaceInfo = (await collectNetwork()).primary;
+  const netInfo = await collectNetwork();
+  const ifaceInfo = netInfo.primary;
 
   // Prefer a real LAN gateway: ask which router sits on the primary interface.
   // (A VPN such as utun10 often owns the default route, so `route get default`
@@ -665,6 +863,10 @@ async function collectDevices(sweep = true) {
   if (!gatewayIp && global.__gatewayIp && lanBase && global.__gatewayIp.startsWith(lanBase + '.')) {
     gatewayIp = global.__gatewayIp;
   }
+  // the routing table is the most reliable source for the default gateway
+  if (!gatewayIp && netInfo.gateway && lanBase && netInfo.gateway.startsWith(lanBase + '.')) {
+    gatewayIp = netInfo.gateway;
+  }
 
   const devices = new Map();
 
@@ -677,22 +879,80 @@ async function collectDevices(sweep = true) {
     if (prefix >= 24 && lanBase) {
       const targets = [];
       for (let i = 1; i <= 254; i++) targets.push(`${lanBase}.${i}`);
-      await pingSweep(targets);
+      const alive = await pingSweep(targets);
+      // hosts that answered ping are real even when the ARP cache is empty
+      for (const ip of alive) {
+        if (!devices.has(ip)) devices.set(ip, { ip, mac: '', name: '', vendor: '', iface: '', source: 'ping' });
+      }
       parseArp(await run('arp', ['-an'], 5000), devices);
       for (const d of devices.values()) if (d.source === 'arp') d.source = 'sweep';
     }
   }
 
+  // 3. devices advertising Bonjour are real even if they don't answer ping or
+  //    ARP — seed them in so the panel is never blank while the cache warms.
+  const bIndex = buildBonjourIndex();
+  for (const ip of bIndex.keys()) {
+    if (!devices.has(ip)) devices.set(ip, { ip, mac: '', name: '', vendor: '', iface: '', source: 'bonjour' });
+  }
+
   const list = [...devices.values()].map((d) => {
     const isSelf = !!ifaceInfo && d.ip === ifaceInfo.address;
     const isGateway = !!gatewayIp && d.ip === gatewayIp;
+    const b = bIndex.get(d.ip);
+    const en = enrichCache.get(d.ip);
+    let name = isGateway ? 'Router / Gateway' : isSelf ? 'This Mac' : null;
+    let type = '';
+    let via = null;
+    // Bonjour sometimes reveals the MAC even when the ARP cache is empty
+    // (e.g. "jgpt [b8:27:eb:61:3e:2d]") — restore the OUI vendor from it.
+    if (!d.mac && b && b.mac) {
+      d.mac = b.mac;
+      d.vendor = vendorFor(b.mac) || d.vendor;
+    }
+    if (b) {
+      via = 'Bonjour · ' + b.service;
+      type = [b.model, b.manufacturer].filter(Boolean).join(' · ');
+      let bName = cleanInstanceName(b.name, b.service);
+      if (!bName && (b.service === 'AirPlay' || b.service === 'AirPlay Receiver')) bName = 'Apple device (AirPlay)';
+      // only fall back to the mDNS hostname when it's a real name, not a UUID
+      if (!bName && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(b.host || '')) bName = b.host;
+      if (!bName && !name && SERVICE_GENERIC_NAMES[b.service]) bName = SERVICE_GENERIC_NAMES[b.service];
+      if (!name) name = bName;
+    }
+    if (!name && en && en.smb && en.smb.name) {
+      name = en.smb.name;
+      via = 'SMB';
+    }
+    if (!name) name = d.vendor || 'Unknown device';
     return {
       ...d,
       isSelf,
       isGateway,
-      name: isGateway ? 'Router / Gateway' : isSelf ? 'This Mac' : d.vendor || 'Unknown device',
+      name,
+      type,
+      via,
+      ports: en ? en.ports : [],
+      os: en && en.smb ? en.smb.os : null,
     };
   });
+
+  // probe still-unknown devices (port fingerprint + SMB), bounded + cached
+  await enrichUnknown(list);
+  for (const d of list) {
+    if (d.isGateway || d.isSelf) continue;
+    if (!d.name || d.name === 'Unknown device' || d.name === d.vendor) {
+      const en = enrichCache.get(d.ip);
+      if (en && en.smb && en.smb.name) { d.name = en.smb.name; d.via = 'SMB'; }
+      else if (!d.name || d.name === 'Unknown device' || d.name === d.vendor) d.name = d.vendor || 'Unknown device';
+    }
+    const en = enrichCache.get(d.ip);
+    if (en) {
+      d.ports = en.ports;
+      if (en.type && !d.type) d.type = en.type;
+      if (en.smb && en.smb.os) d.os = en.smb.os;
+    }
+  }
 
   list.sort((a, b) => (b.isGateway - a.isGateway) || (b.isSelf - a.isSelf) || ipSort(a.ip, b.ip));
 
@@ -706,16 +966,20 @@ async function collectDevices(sweep = true) {
   };
 }
 
-// ping sweep with bounded parallelism
-async function pingSweep(targets, concurrency = 48) {
+// ping sweep with bounded parallelism — returns the IPs that answered, so the
+// device table doesn't depend on the ARP cache (which can be transiently empty)
+async function pingSweep(targets, concurrency = 128) {
+  const alive = [];
   let idx = 0;
   const workers = Array.from({ length: concurrency }, async () => {
     while (idx < targets.length) {
       const host = targets[idx++];
-      await run('ping', ['-c', '1', '-W', '200', host], 1200);
+      const r = await runExit('ping', ['-c', '1', '-W', '200', host], 1200);
+      if (r.ok) alive.push(host);
     }
   });
   await Promise.all(workers);
+  return alive;
 }
 
 function ipSort(a, b) {
@@ -750,7 +1014,12 @@ function vendorFor(mac) {
     'CC:50:E3': 'Espressif', '84:CC:A8': 'Espressif',
     'B8:27:EB ': 'Raspberry Pi',
   };
-  return table[prefix] || '';
+  if (table[prefix]) return table[prefix];
+  if (mac) {
+    const oui = mac.replace(/:/g, '').toUpperCase().slice(0, 6);
+    if (OUI[oui]) return OUI[oui];
+  }
+  return '';
 }
 
 /* ------------------------------------------------------------------ */
@@ -790,12 +1059,26 @@ function parseThermal(out) {
 
 function parseSmartBattery(out) {
   const kv = {};
-  for (const m of out.matchAll(/^[ \t]*"(\w+)"\s*=\s*([^\n]+)/gm)) {
+  // top-level keys — lines may carry a registry-tree prefix like "  |   "
+  for (const m of out.matchAll(/^[ \t|]*"(\w+)"\s*=\s*([^\n]+)/gm)) {
     const v = m[2].trim();
     if (v === 'Yes') kv[m[1]] = true;
     else if (v === 'No') kv[m[1]] = false;
-    else if (!isNaN(Number(v)) && !/^[<{]/.test(v)) kv[m[1]] = Number(v);
+    else if (!isNaN(Number(v)) && !/^[<{(]/.test(v)) kv[m[1]] = Number(v);
     else kv[m[1]] = v;
+  }
+  // newer macOS nests design/charge keys inside BatteryData and ChargerData
+  for (const m of out.matchAll(/"(\w+)"\s*=\s*\{([^{}]*)\}/g)) {
+    if (m[1] !== 'BatteryData' && m[1] !== 'ChargerData') continue;
+    for (const inner of m[2].matchAll(/"(\w+)"\s*=\s*([^,}]+)/g)) {
+      const k = inner[1];
+      if (k in kv) continue;
+      const v = inner[2].trim().replace(/^"|"$/g, '');
+      if (v === 'Yes') kv[k] = true;
+      else if (v === 'No') kv[k] = false;
+      else if (!isNaN(Number(v))) kv[k] = Number(v);
+      else kv[k] = v;
+    }
   }
   return kv;
 }
@@ -1067,7 +1350,7 @@ async function mapConcurrent(items, concurrency, fn) {
 // stdout we collected — replies for cached services arrive within ~100ms, so
 // the kill timeout is the real per-call cost, not the data.
 async function dnsBrowseType(type) {
-  const out = await run('dns-sd', ['-B', type, 'local'], 1400);
+  const out = await run('dns-sd', ['-B', type, 'local'], 2000);
   const instances = [];
   const seen = new Set();
   for (const line of out.split('\n')) {
@@ -1251,8 +1534,9 @@ const routes = {
   '/api/system': async () => buildSnapshot(),
   '/api/snapshot': async () => buildSnapshot(true),
   '/api/net': collectNetwork,
-  '/api/ping': async () => {
-    if (pingCache.data && Date.now() - pingCache.at < 8000) return pingCache.data;
+  '/api/ping': async (u) => {
+    const force = u && u.searchParams && u.searchParams.get('force') != null;
+    if (!force && pingCache.data && Date.now() - pingCache.at < 8000) return pingCache.data;
     const data = await measurePing();
     pingCache.at = Date.now();
     pingCache.data = data;
@@ -1287,7 +1571,7 @@ const server = http.createServer(async (req, res) => {
 
   if (routes[url.pathname]) {
     try {
-      const data = await routes[url.pathname]();
+      const data = await routes[url.pathname](url);
       send(res, 200, JSON.stringify(data));
     } catch (err) {
       send(res, 500, JSON.stringify({ error: String(err && err.message || err) }));

@@ -9,6 +9,17 @@ PORT="${SYSMON_PORT:-7717}"
 URL="http://127.0.0.1:${PORT}"
 LOG="/tmp/sysmon.log"
 
+# locate node — it may be keg-only Homebrew (node@22) and not on PATH
+NODE_BIN=""
+for cand in node /opt/homebrew/opt/node@22/bin/node /opt/homebrew/opt/node/bin/node /usr/local/bin/node \
+            "$HOME"/.nvm/versions/node/*/bin/node "$HOME"/.asdf/installs/nodejs/*/bin/node; do
+  if command -v "$cand" >/dev/null 2>&1; then NODE_BIN="$(command -v "$cand")"; break; fi
+done
+if [ -z "${NODE_BIN}" ]; then
+  echo "error: node.js not found. Install it, e.g.: brew install node" >&2
+  exit 1
+fi
+
 # already running? just open a new tab.
 if curl -s --max-time 1 "${URL}/api/health" >/dev/null 2>&1; then
   echo "sysmon already running → opening ${URL}"
@@ -25,7 +36,7 @@ if lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 echo "starting sysmon on ${URL} ..."
-SYSMON_PORT="${PORT}" nohup node "${SYSMON_DIR}/server.js" >"${LOG}" 2>&1 &
+SYSMON_PORT="${PORT}" nohup "${NODE_BIN}" "${SYSMON_DIR}/server.js" >"${LOG}" 2>&1 &
 SERVER_PID=$!
 disown 2>/dev/null || true
 

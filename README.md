@@ -34,7 +34,7 @@ Logs go to `/tmp/sysmon.log`.
 | **Latency** — avg / min–max / jitter / packet loss to 3 targets | `ping -c 5` |
 | **Connection details** — IPv4/prefix, MAC, media, Wi-Fi SSID, LAN gateway, DNS, VPN tunnel count | `ifconfig`, `networksetup`, `scutil --dns`, `route` |
 | **Network interfaces** — active/idle, addresses, cumulative totals | `ifconfig` + `netstat -ib` |
-| **Connected devices** — every host on the LAN with IP, MAC, vendor | active ping sweep of the /24 + `arp` |
+| **Connected devices** — every host on the LAN with IP, MAC, vendor, real Bonjour name/model, open ports, inferred type | ping sweep of the /24 + `arp` + bundled OUI DB + `dns-sd` + `nc` + `smbutil` |
 | **Listening ports** — TCP + bound UDP with owning process and PID | `netstat -anv -p tcp`, `lsof` |
 | **Processes** — top CPU / top memory, RSS | `ps -axo ... -r` |
 | **System** — host, model, chip, OS, uptime, boot time | `sysctl`, `os` |
@@ -56,10 +56,32 @@ dns-sd each take a few seconds to sample, so they run slowly).
   macOS deliberately keeps RAM full via caching — a high % is normal, swapping
   is not. `normal` → `elevated` (>25% swap) → `critical` (>60%).
 - **Connected devices** are found by pinging every address on your /24 in
-  bounded parallelism, then reading the ARP cache. Devices that don't answer
-  ping (many IoT and phones) will not appear. Delivery is best-effort.
-- **Vendor names** come from a built-in MAC OUI table, so it covers common
-  vendors only — unlisted hardware shows as "Unknown device".
+  bounded parallelism, then reading the ARP cache. Discovery is **multi-source**
+  so the panel is never blank: any host that answers the sweep ping shows up
+  even if the ARP cache is empty, and devices advertising Bonjour/mDNS are
+  seeded in by IP too. Devices that ignore ping and don't advertise Bonjour will
+  not appear (many phones/IoT in their default power-saving mode). Delivery is
+  best-effort.
+- **Vendor names** come from a bundled ~40k-prefix OUI database generated from
+  the Wireshark `manuf` data (`data/oui.json.gz`, loaded at startup). MACs
+  using randomized/private addresses (the 2nd-lowest bit of the first octet
+  set — common on phones and some laptops) have no registered OUI and show as
+  "Unknown device"; that's inherent to how randomized MACs work, not a gap in
+  the database.
+- **Device names & models**: devices advertising Bonjour/mDNS are joined to the
+  Local Services sweep by IP, so they get their real instance name and model
+  (e.g. "Samsung 8 Series (65)", "Google Home Mini"). Auto-generated hash names
+  (Vizio TVs, Amazon Echo DMGR ids, UUIDs) are cleaned to a friendly label.
+- **Open ports & type**: hosts that are still unidentified get a quick `nc`
+  probe of ~15 common TCP ports (SSH, HTTP(S), SMB, printing, Roku, AirPlay,
+  Plex, RDP…). Open ports are shown as chips on the card and used to infer a
+  device type (printer, NAS, router, media player…). Results are cached per IP
+  for 30 min and probed a few at a time so a sweep stays cheap. `smbutil`
+  adds the SMB hostname/OS for devices that expose port 445.
+- **Latency panel**: the **Ping** button forces a fresh measurement (bypassing
+  the 8s cache) and shows a "measuring…" state while the 5-ping × 3-target
+  probe runs; the status line under the panel reports how many targets answered
+  and the best latency afterwards.
 - **Bandwidth totals** (↓/↑ Total) are the interface's cumulative counters since
   boot, not a rate.
 - **VPN tunnels** (`utun*`) are excluded from the interface table to avoid
@@ -102,6 +124,8 @@ dns-sd each take a few seconds to sample, so they run slowly).
 sysmon/
 ├── server.js        # collector + HTTP server (no deps)
 ├── system           # launcher: starts server, opens the tab
+├── data/
+│   └── oui.json.gz  # ~40k MAC-prefix → vendor map (Wireshark manuf data)
 ├── research/
 │   └── candidate-tools.md   # surveyed tools, priorities, risks
 └── public/
