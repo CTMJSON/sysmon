@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+#
+# system — launch the sysmon dashboard in a local browser tab
+#
+set -euo pipefail
+
+SYSMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PORT="${SYSMON_PORT:-7717}"
+URL="http://127.0.0.1:${PORT}"
+LOG="/tmp/sysmon.log"
+
+# already running? just open a new tab.
+if curl -s --max-time 1 "${URL}/api/health" >/dev/null 2>&1; then
+  echo "sysmon already running → opening ${URL}"
+  open "${URL}"
+  exit 0
+fi
+
+# port occupied by something else?
+if lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >/dev/null 2>&1; then
+  echo "error: port ${PORT} is in use by another process:" >&2
+  lsof -nP -iTCP:"${PORT}" -sTCP:LISTEN >&2
+  echo "run with a different port, e.g.: SYSMON_PORT=8080 system" >&2
+  exit 1
+fi
+
+echo "starting sysmon on ${URL} ..."
+SYSMON_PORT="${PORT}" nohup node "${SYSMON_DIR}/server.js" >"${LOG}" 2>&1 &
+SERVER_PID=$!
+disown 2>/dev/null || true
+
+# wait for it to come up
+for _ in $(seq 1 40); do
+  if curl -s --max-time 1 "${URL}/api/health" >/dev/null 2>&1; then
+    open "${URL}"
+    echo "sysmon running (pid ${SERVER_PID}) — logs: ${LOG}"
+    exit 0
+  fi
+  sleep 0.15
+done
+
+echo "sysmon failed to start. Last log lines:" >&2
+tail -n 20 "${LOG}" >&2
+exit 1

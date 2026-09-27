@@ -1,0 +1,920 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sysmon · system monitor</title>
+<style>
+  :root {
+    --bg: #08090c;
+    --panel: rgba(20, 22, 28, 0.72);
+    --panel-solid: #14161c;
+    --border: rgba(255, 255, 255, 0.07);
+    --border-strong: rgba(255, 255, 255, 0.13);
+    --text: #e8eaf0;
+    --muted: #8b90a0;
+    --dim: #5b6070;
+    --accent: #6ea8fe;
+    --accent-2: #7ef0c0;
+    --warn: #ffc46b;
+    --danger: #ff6b81;
+    --violet: #b98cff;
+    --radius: 16px;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif;
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+    min-height: 100%;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(900px 500px at 12% -8%, rgba(110, 168, 254, 0.10), transparent 60%),
+      radial-gradient(800px 480px at 92% 4%, rgba(185, 140, 255, 0.09), transparent 62%),
+      radial-gradient(700px 400px at 50% 110%, rgba(126, 240, 192, 0.05), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .wrap {
+    position: relative;
+    z-index: 1;
+    max-width: 1440px;
+    margin: 0 auto;
+    padding: 26px 26px 64px;
+  }
+
+  /* ---------- header ---------- */
+  header.top {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+    padding-bottom: 20px;
+    margin-bottom: 20px;
+    border-bottom: 1px solid var(--border);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .logo {
+    width: 38px; height: 38px;
+    border-radius: 11px;
+    background: linear-gradient(140deg, #6ea8fe, #b98cff);
+    display: grid; place-items: center;
+    box-shadow: 0 6px 22px rgba(110, 168, 254, 0.28);
+    flex: none;
+  }
+  .logo svg { width: 20px; height: 20px; }
+  .brand h1 { margin: 0; font-size: 17px; font-weight: 650; letter-spacing: -0.01em; }
+  .brand .sub { color: var(--muted); font-size: 12px; font-family: var(--mono); margin-top: 1px; }
+
+  .status-pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 6px 12px; border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    background: rgba(255,255,255,0.03);
+    font-size: 12px; color: var(--muted);
+    font-family: var(--mono);
+  }
+  .status-pill.online { color: var(--accent-2); border-color: rgba(126,240,192,0.3); background: rgba(126,240,192,0.07); }
+  .status-pill.offline { color: var(--danger); border-color: rgba(255,107,129,0.3); background: rgba(255,107,129,0.07); }
+
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .dot.pulse { animation: pulse 2s ease-in-out infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .4; transform: scale(.8); } }
+
+  .header-right { margin-left: auto; display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
+  button {
+    font-family: var(--sans);
+    font-size: 12.5px;
+    font-weight: 550;
+    color: var(--text);
+    background: rgba(255,255,255,0.05);
+    border: 1px solid var(--border-strong);
+    padding: 7px 14px;
+    border-radius: 9px;
+    cursor: pointer;
+    transition: all .16s ease;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  button:hover { background: rgba(255,255,255,0.09); border-color: rgba(255,255,255,0.22); }
+  button:active { transform: translateY(1px); }
+  button.primary { background: linear-gradient(140deg, rgba(110,168,254,0.9), rgba(185,140,255,0.85)); border-color: transparent; color: #07080b; font-weight: 650; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.busy { opacity: .6; pointer-events: none; }
+  button svg { width: 14px; height: 14px; }
+
+  /* ---------- grid ---------- */
+  .grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 16px; }
+  .card {
+    background: var(--panel);
+    backdrop-filter: blur(18px);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px;
+    position: relative;
+    overflow: hidden;
+  }
+  .card:hover { border-color: var(--border-strong); }
+
+  .span-3 { grid-column: span 3; }
+  .span-4 { grid-column: span 4; }
+  .span-5 { grid-column: span 5; }
+  .span-6 { grid-column: span 6; }
+  .span-7 { grid-column: span 7; }
+  .span-8 { grid-column: span 8; }
+  .span-12 { grid-column: span 12; }
+  @media (max-width: 1180px) {
+    .span-3, .span-4, .span-5 { grid-column: span 6; }
+    .span-7, .span-8 { grid-column: span 12; }
+  }
+  @media (max-width: 720px) {
+    .span-3, .span-4, .span-5, .span-6, .span-7, .span-8 { grid-column: span 12; }
+    .wrap { padding: 16px 14px 48px; }
+  }
+
+  .card-head { display: flex; align-items: center; gap: 9px; margin-bottom: 15px; }
+  .card-head h2 { margin: 0; font-size: 12px; font-weight: 600; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+  .card-head .ico { color: var(--dim); display: grid; place-items: center; }
+  .card-head .ico svg { width: 15px; height: 15px; }
+  .card-head .tail { margin-left: auto; font-size: 11.5px; color: var(--dim); font-family: var(--mono); }
+
+  /* ---------- metric ---------- */
+  .metric { display: flex; align-items: baseline; gap: 8px; }
+  .metric .val { font-size: 34px; font-weight: 680; letter-spacing: -0.025em; line-height: 1; font-variant-numeric: tabular-nums; }
+  .metric .unit { font-size: 15px; color: var(--muted); font-weight: 500; }
+  .metric .pct { margin-left: auto; font-size: 12px; font-family: var(--mono); color: var(--muted); }
+
+  .sub-note { font-size: 12px; color: var(--dim); font-family: var(--mono); margin-top: 8px; }
+
+  .bar { height: 7px; border-radius: 999px; background: rgba(255,255,255,0.07); overflow: hidden; margin-top: 12px; }
+  .bar > i { display: block; height: 100%; border-radius: 999px; transition: width .5s cubic-bezier(.2,.8,.2,1); }
+  .fill-blue { background: linear-gradient(90deg, #4d8bff, #6ea8fe); }
+  .fill-green { background: linear-gradient(90deg, #35c48f, #7ef0c0); }
+  .fill-amber { background: linear-gradient(90deg, #e8a13a, #ffc46b); }
+  .fill-red { background: linear-gradient(90deg, #e8455f, #ff6b81); }
+  .fill-violet { background: linear-gradient(90deg, #9166e8, #b98cff); }
+
+  /* stacked memory bar */
+  .stack { display: flex; height: 9px; border-radius: 999px; overflow: hidden; background: rgba(255,255,255,0.06); margin-top: 12px; }
+  .stack > i { display: block; height: 100%; transition: width .5s ease; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 16px; margin-top: 12px; }
+  .legend .item { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--muted); font-family: var(--mono); }
+  .legend .swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+
+  /* ---------- sparkline ---------- */
+  .spark { width: 100%; height: 44px; display: block; margin-top: 10px; }
+
+  /* ---------- tables ---------- */
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  th {
+    text-align: left; font-weight: 550; color: var(--dim);
+    font-size: 10.5px; letter-spacing: .07em; text-transform: uppercase;
+    padding: 0 10px 9px 0; border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; background: transparent;
+  }
+  td { padding: 8px 10px 8px 0; border-bottom: 1px solid rgba(255,255,255,0.035); color: #cfd3dd; }
+  tr:last-child td { border-bottom: none; }
+  tbody tr:hover td { background: rgba(255,255,255,0.025); }
+  .mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  .right { text-align: right; }
+  .truncate { max-width: 340px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .scroll { max-height: 330px; overflow-y: auto; margin-right: -6px; padding-right: 6px; }
+  .scroll::-webkit-scrollbar { width: 7px; }
+  .scroll::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.12); border-radius: 4px; }
+  .scroll::-webkit-scrollbar-track { background: transparent; }
+
+  .tag {
+    display: inline-block; padding: 2px 7px; border-radius: 6px;
+    font-size: 10px; font-family: var(--mono); font-weight: 600;
+    border: 1px solid var(--border-strong); color: var(--muted);
+    letter-spacing: .02em;
+  }
+  .tag.blue { color: var(--accent); border-color: rgba(110,168,254,.32); background: rgba(110,168,254,.09); }
+  .tag.green { color: var(--accent-2); border-color: rgba(126,240,192,.3); background: rgba(126,240,192,.08); }
+  .tag.violet { color: var(--violet); border-color: rgba(185,140,255,.3); background: rgba(185,140,255,.08); }
+  .tag.amber { color: var(--warn); border-color: rgba(255,196,107,.3); background: rgba(255,196,107,.08); }
+  .tag.red { color: var(--danger); border-color: rgba(255,107,129,.3); background: rgba(255,107,129,.08); }
+
+  /* ---------- kv list ---------- */
+  .kv { display: grid; grid-template-columns: auto 1fr; gap: 9px 14px; font-size: 12.5px; }
+  .kv dt { color: var(--dim); font-family: var(--mono); font-size: 11.5px; }
+  .kv dd { margin: 0; color: #d5d9e3; text-align: right; font-family: var(--mono); font-size: 11.5px; overflow-wrap: anywhere; }
+
+  /* ---------- ping targets ---------- */
+  .ping-row { display: flex; align-items: center; gap: 12px; padding: 9px 0; border-bottom: 1px solid rgba(255,255,255,0.035); }
+  .ping-row:last-child { border-bottom: none; }
+  .ping-row .nm { font-size: 12.5px; min-width: 104px; }
+  .ping-row .ms { font-family: var(--mono); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+  .ping-bar { flex: 1; height: 5px; border-radius: 999px; background: rgba(255,255,255,0.06); overflow: hidden; }
+  .ping-bar > i { display: block; height: 100%; border-radius: 999px; }
+  .ping-row .loss { font-family: var(--mono); font-size: 11px; color: var(--dim); min-width: 82px; text-align: right; }
+
+  /* ---------- speedometer ---------- */
+  .speed-wrap { display: flex; gap: 18px; align-items: center; flex-wrap: wrap; }
+  .speed-half { flex: 1; min-width: 130px; }
+  .speed-half .lbl { font-size: 11px; letter-spacing: .08em; text-transform: uppercase; color: var(--dim); }
+  .speed-half .big { font-size: 30px; font-weight: 680; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; margin: 3px 0 2px; }
+  .speed-half .big span { font-size: 13px; color: var(--muted); font-weight: 500; }
+  .gauge-track { height: 6px; border-radius: 999px; background: rgba(255,255,255,0.07); overflow: hidden; }
+  .gauge-track > i { display: block; height: 100%; border-radius: 999px; transition: width .8s cubic-bezier(.2,.8,.2,1); }
+
+  /* ---------- device cards ---------- */
+  .dev-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(215px, 1fr)); gap: 10px; }
+  .dev {
+    border: 1px solid var(--border); border-radius: 11px; padding: 11px 13px;
+    background: rgba(255,255,255,0.02);
+    display: flex; flex-direction: column; gap: 5px;
+    transition: all .16s ease;
+  }
+  .dev:hover { border-color: var(--border-strong); background: rgba(255,255,255,0.04); }
+  .dev .ip { font-family: var(--mono); font-size: 12.5px; font-weight: 600; display: flex; align-items: center; gap: 7px; }
+  .dev .meta { font-family: var(--mono); font-size: 10.5px; color: var(--dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dev .top { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+
+  /* ---------- misc ---------- */
+  .loading { color: var(--dim); font-size: 12.5px; font-family: var(--mono); padding: 12px 0; }
+  .empty { color: var(--dim); font-size: 12.5px; font-family: var(--mono); padding: 14px 0; text-align: center; }
+  .fade-in { animation: fade .35s ease; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+  .stat-row { display: flex; justify-content: space-between; font-size: 12.5px; padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.035); }
+  .stat-row:last-child { border-bottom: none; }
+  .stat-row .k { color: var(--muted); }
+  .stat-row .v { font-family: var(--mono); color: #d5d9e3; }
+  .updated { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+  .err { color: var(--danger); font-family: var(--mono); font-size: 12px; }
+  .spin { animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#07080b" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="4" width="18" height="12" rx="2"/><path d="M7 20h10M12 16v4"/>
+        </svg>
+      </div>
+      <div>
+        <h1 id="hostname">sysmon</h1>
+        <div class="sub" id="sysmeta">loading…</div>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="status-pill" id="conn-pill"><span class="dot pulse"></span><span id="conn-text">connecting…</span></div>
+      <div class="updated" id="last-update">—</div>
+      <button id="btn-speed" class="primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg>
+        Speed test
+      </button>
+      <button id="btn-ping">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 20v-6M4 20h16M12 14a6 6 0 0 0 0-12"/></svg>
+        Ping
+      </button>
+      <button id="btn-refresh">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M21 12a9 9 0 1 1-3-6.7M21 3v6h-6"/></svg>
+        Refresh
+      </button>
+    </div>
+  </header>
+
+  <div class="grid">
+    <!-- CPU -->
+    <section class="card span-3">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg></span>
+        <h2>CPU</h2>
+        <span class="tail" id="cpu-cores"></span>
+      </div>
+      <div class="metric"><span class="val" id="cpu-val">—</span><span class="unit">%</span><span class="pct" id="cpu-load"></span></div>
+      <div class="bar"><i id="cpu-bar" class="fill-blue" style="width:0%"></i></div>
+      <canvas class="spark" id="cpu-spark"></canvas>
+    </section>
+
+    <!-- Memory -->
+    <section class="card span-4">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 17v3M18 17v3M6 4v3M18 4v3"/></svg></span>
+        <h2>Memory</h2>
+        <span class="tail" id="mem-swap"></span>
+      </div>
+      <div class="metric"><span class="val" id="mem-val">—</span><span class="unit" id="mem-total"></span><span class="pct" id="mem-pct"></span></div>
+      <div class="stack" id="mem-stack"></div>
+      <div class="legend" id="mem-legend"></div>
+    </section>
+
+    <!-- Disk -->
+    <section class="card span-5">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg></span>
+        <h2>Disk</h2>
+        <span class="tail" id="disk-mount"></span>
+      </div>
+      <div class="metric"><span class="val" id="disk-val">—</span><span class="unit" id="disk-total"></span><span class="pct" id="disk-pct"></span></div>
+      <div class="bar"><i id="disk-bar" class="fill-violet" style="width:0%"></i></div>
+      <div class="legend" style="margin-top:11px">
+        <span class="item"><span class="swatch" style="background:#35c48f"></span>free <b id="disk-free" class="mono" style="color:#cfd3dd;font-weight:500"></b></span>
+        <span class="item"><span class="swatch" style="background:#7ef0c0"></span>read <b id="disk-read" class="mono" style="color:#cfd3dd;font-weight:500"></b></span>
+        <span class="item"><span class="swatch" style="background:#b98cff"></span>write <b id="disk-write" class="mono" style="color:#cfd3dd;font-weight:500"></b></span>
+      </div>
+    </section>
+
+    <!-- Network throughput -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v18M7 8l5-5 5 5M7 16l5 5 5-5"/></svg></span>
+        <h2>Network Throughput</h2>
+        <span class="tail" id="net-iface"></span>
+      </div>
+      <div class="speed-wrap">
+        <div class="speed-half">
+          <div class="lbl">↓ Download</div>
+          <div class="big" id="net-rx">—<span> KB/s</span></div>
+          <div class="gauge-track"><i id="net-rx-bar" class="fill-green" style="width:0%"></i></div>
+        </div>
+        <div class="speed-half">
+          <div class="lbl">↑ Upload</div>
+          <div class="big" id="net-tx">—<span> KB/s</span></div>
+          <div class="gauge-track"><i id="net-tx-bar" class="fill-blue" style="width:0%"></i></div>
+        </div>
+      </div>
+      <canvas class="spark" id="net-spark"></canvas>
+    </section>
+
+    <!-- Speed test -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M13 2 3 14h7l-1 8 10-12h-7l1-8z"/></svg></span>
+        <h2>Internet Speed</h2>
+        <span class="tail" id="speed-src"></span>
+      </div>
+      <div class="speed-wrap">
+        <div class="speed-half">
+          <div class="lbl">↓ Down</div>
+          <div class="big" id="speed-down">—<span> Mbps</span></div>
+          <div class="gauge-track"><i id="speed-down-bar" class="fill-green" style="width:0%"></i></div>
+        </div>
+        <div class="speed-half">
+          <div class="lbl">↑ Up</div>
+          <div class="big" id="speed-up">—<span> Mbps</span></div>
+          <div class="gauge-track"><i id="speed-up-bar" class="fill-blue" style="width:0%"></i></div>
+        </div>
+      </div>
+      <div class="sub-note" id="speed-note">run a test to measure your connection</div>
+    </section>
+
+    <!-- Latency -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>
+        <h2>Latency &amp; Connectivity</h2>
+        <span class="tail" id="ping-at"></span>
+      </div>
+      <div id="ping-list"><div class="loading">measuring…</div></div>
+    </section>
+
+    <!-- Connection details -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12.5a10 10 0 0 1 14 0M8.5 16a5 5 0 0 1 7 0M12 19.5h.01"/></svg></span>
+        <h2>Connection Details</h2>
+        <span class="tail" id="conn-iface"></span>
+      </div>
+      <dl class="kv" id="conn-kv"></dl>
+    </section>
+
+    <!-- Interfaces -->
+    <section class="card span-12">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M7 10h.01M12 10h.01M17 10h.01M8 14h8"/></svg></span>
+        <h2>Network Interfaces</h2>
+        <span class="tail" id="iface-count"></span>
+      </div>
+      <div class="scroll" style="max-height:280px">
+        <table>
+          <thead><tr><th>Interface</th><th>State</th><th>IPv4</th><th>IPv6</th><th>MAC</th><th class="right">↓ Total</th><th class="right">↑ Total</th></tr></thead>
+          <tbody id="iface-body"><tr><td colspan="7" class="loading">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Devices -->
+    <section class="card span-12">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+        <h2>Connected Devices</h2>
+        <span class="tail" id="dev-subnet"></span>
+      </div>
+      <div id="dev-grid" class="dev-grid"><div class="loading">scanning local network…</div></div>
+    </section>
+
+    <!-- Ports -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="10" rx="2"/><path d="M6 11v2M10 11v2M14 11v2M18 11v2"/></svg></span>
+        <h2>Listening Ports</h2>
+        <span class="tail" id="port-count"></span>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>Port</th><th>Proto</th><th>Process</th><th>PID</th><th>Bind</th></tr></thead>
+          <tbody id="port-body"><tr><td colspan="5" class="loading">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Processes -->
+    <section class="card span-6">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18"/><path d="M7 15l3-4 3 3 5-7"/></svg></span>
+        <h2>Processes</h2>
+        <span class="tail" id="proc-count"></span>
+      </div>
+      <div style="display:flex;gap:8px;margin-bottom:12px" id="proc-tabs">
+        <button class="primary" data-tab="cpu" style="padding:5px 11px;font-size:11.5px">Top CPU</button>
+        <button data-tab="mem" style="padding:5px 11px;font-size:11.5px">Top Memory</button>
+      </div>
+      <div class="scroll">
+        <table>
+          <thead><tr><th>PID</th><th>Process</th><th class="right">CPU%</th><th class="right">MEM%</th><th class="right">RSS</th></tr></thead>
+          <tbody id="proc-body"><tr><td colspan="5" class="loading">loading…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- System -->
+    <section class="card span-12">
+      <div class="card-head">
+        <span class="ico"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M12 8v.01M11 12h1v4h1"/></svg></span>
+        <h2>System</h2>
+        <span class="tail" id="sys-tail"></span>
+      </div>
+      <dl class="kv" id="sys-kv" style="grid-template-columns:repeat(auto-fit, minmax(300px, 1fr)); gap:9px 40px"></dl>
+    </section>
+  </div>
+</div>
+
+<script>
+/* ==================================================================
+   sysmon dashboard client
+   ================================================================== */
+
+const $ = (id) => document.getElementById(id);
+const API = (p) => fetch(p, { cache: 'no-store' }).then((r) => r.json());
+
+/* ---------- formatting ---------- */
+function bytes(n, dec = 1) {
+  if (n == null || !isFinite(n)) return '—';
+  const u = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(i === 0 ? 0 : dec) + ' ' + u[i];
+}
+function kbs(n) {
+  if (n == null || !isFinite(n)) return '—';
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB/s';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB/s';
+  return n.toFixed(0) + ' B/s';
+}
+function dur(sec) {
+  sec = Math.max(0, Math.floor(sec));
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d) return `${d}d ${h}h ${m}m`;
+  if (h) return `${h}h ${m}m`;
+  return `${m}m ${sec % 60}s`;
+}
+function clock(ts) {
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+const esc = (s) => String(s == null ? '' : s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+/* ---------- sparkline ---------- */
+class Spark {
+  constructor(canvas, max = 60, colors = ['#6ea8fe']) {
+    this.c = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.max = max;
+    this.colors = Array.isArray(colors) ? colors : [colors];
+    this.data = this.colors.map(() => []);
+    this.ceiling = 100;
+    this.resize();
+    window.addEventListener('resize', () => { this.resize(); this.draw(); });
+  }
+  resize() {
+    const dpr = window.devicePixelRatio || 1;
+    const r = this.c.getBoundingClientRect();
+    this.w = Math.max(1, r.width);
+    this.h = Math.max(1, r.height);
+    this.c.width = this.w * dpr;
+    this.c.height = this.h * dpr;
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  push(...vals) {
+    vals.forEach((v, i) => {
+      if (!Array.isArray(this.data[i])) this.data[i] = [];
+      this.data[i].push(v || 0);
+      if (this.data[i].length > this.max) this.data[i].shift();
+    });
+    this.ceiling = Math.max(...this.data.flat().map((x) => x || 0), this.ceiling * 0.7, 1);
+    this.draw();
+  }
+  setCeiling(c) { this.ceiling = Math.max(c, 1); }
+  draw() {
+    const { ctx, w, h } = this;
+    ctx.clearRect(0, 0, w, h);
+    // baseline grid
+    ctx.strokeStyle = 'rgba(255,255,255,0.05)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 3; i++) {
+      const y = (h / 3) * i;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+    }
+
+    this.data.forEach((series, si) => {
+      if (series.length < 2) return;
+      const color = this.colors[si % this.colors.length];
+      const step = w / (this.max - 1);
+      const pt = (i) => {
+        const v = Math.min(series[i] / this.ceiling, 1);
+        return [i * step + (w - step * (series.length - 1)), h - v * (h - 3) - 1.5];
+      };
+      ctx.beginPath();
+      for (let i = 0; i < series.length; i++) {
+        const [x, y] = pt(i);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.8;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.stroke();
+
+      // gradient fill
+      const [x0] = pt(0);
+      const [xN] = pt(series.length - 1);
+      ctx.lineTo(xN, h);
+      ctx.lineTo(x0, h);
+      ctx.closePath();
+      const g = ctx.createLinearGradient(0, 0, 0, h);
+      g.addColorStop(0, color + '38');
+      g.addColorStop(1, color + '00');
+      ctx.fillStyle = g;
+      ctx.fill();
+    });
+  }
+}
+
+/* ---------- state ---------- */
+const cpuSpark = new Spark($('cpu-spark'), 60, ['#6ea8fe']);
+const netSpark = new Spark($('net-spark'), 60, ['#7ef0c0', '#6ea8fe']);
+let procTab = 'cpu';
+let lastProcData = null;
+
+/* ---------- renderers ---------- */
+function renderSystem(s, uptimeServer) {
+  $('hostname').textContent = s.hostname;
+  $('sysmeta').textContent = `${s.platform} · ${s.arch} · up ${dur(s.uptime)}`;
+  $('sys-tail').textContent = `booted ${new Date(s.bootTime).toLocaleString()}`;
+  $('cpu-cores').textContent = `${s.cpuModel.replace(/\(R\)|\(TM\)/g, '').replace(/\s+/g, ' ').trim().slice(0, 26)} · ${s.cpuModel ? '' : ''}`;
+
+  const rows = [
+    ['Hostname', s.hostname],
+    ['Hardware Model', s.model],
+    ['Processor', s.cpuModel],
+    ['Platform', s.platform],
+    ['Architecture', s.arch],
+    ['Uptime', dur(s.uptime)],
+    ['Boot Time', new Date(s.bootTime).toLocaleString()],
+    ['Kernel Node', s.node],
+    ['Dashboard Uptime', dur(uptimeServer / 1000)],
+  ];
+  $('sys-kv').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+}
+
+function renderCpu(c) {
+  const v = c.usage || 0;
+  $('cpu-val').textContent = v.toFixed(1);
+  $('cpu-load').textContent = `load ${c.load.one} ${c.load.five} ${c.load.fifteen}`;
+  $('cpu-cores').textContent = `${c.cores} cores · load ${c.load.one}`;
+  const bar = $('cpu-bar');
+  bar.style.width = Math.min(100, v) + '%';
+  bar.className = v > 85 ? 'fill-red' : v > 60 ? 'fill-amber' : 'fill-blue';
+  cpuSpark.push(v);
+}
+
+function renderMemory(m) {
+  $('mem-val').textContent = bytes(m.used, 1);
+  $('mem-total').textContent = `of ${bytes(m.total, 0)}`;
+  $('mem-pct').textContent = m.percent + '%';
+  const pcol = m.pressure === 'critical' ? '#ff6b81' : m.pressure === 'elevated' ? '#ffc46b' : '#7ef0c0';
+  $('mem-swap').innerHTML = m.swap
+    ? `<span class="tag" style="color:${pcol};border-color:${pcol}44;background:${pcol}14">${m.pressure}</span> swap ${bytes(m.swap.used, 1)}`
+    : `<span class="tag" style="color:${pcol};border-color:${pcol}44;background:${pcol}14">${m.pressure}</span>`;
+
+  const b = m.breakdown;
+  const segs = [
+    ['Active', b.active, '#6ea8fe'],
+    ['Wired', b.wired, '#b98cff'],
+    ['Compressed', b.compressed, '#ffc46b'],
+    ['Inactive', b.inactive, '#4d8bff'],
+    ['Free', Math.max(0, m.free), '#2a2d36'],
+  ];
+  const total = m.total || 1;
+  $('mem-stack').innerHTML = segs
+    .map(([, val, col]) => `<i style="width:${(val / total * 100).toFixed(2)}%;background:${col}" title="${bytes(val)}"></i>`)
+    .join('');
+  $('mem-legend').innerHTML = segs
+    .slice(0, 4)
+    .map(([name, val, col]) => `<span class="item"><span class="swatch" style="background:${col}"></span>${name} <b class="mono" style="color:#cfd3dd;font-weight:500">${bytes(val)}</b></span>`)
+    .join('') +
+    `<span class="item"><span class="swatch" style="background:#2a2d36"></span>Free <b class="mono" style="color:#cfd3dd;font-weight:500">${bytes(Math.max(0, m.free))}</b></span>`;
+}
+
+function renderDisk(d) {
+  const p = d.primary;
+  if (!p) return;
+  $('disk-mount').textContent = p.mount;
+  $('disk-val').textContent = bytes(p.used, 1);
+  $('disk-total').textContent = `used of ${bytes(p.size, 0)}`;
+  $('disk-pct').textContent = p.percent + '%';
+  const bar = $('disk-bar');
+  bar.style.width = Math.min(100, p.percent) + '%';
+  bar.className = p.percent > 90 ? 'fill-red' : p.percent > 75 ? 'fill-amber' : 'fill-violet';
+  $('disk-free').textContent = bytes(p.avail);
+  $('disk-read').textContent = kbs(d.io.read);
+  $('disk-write').textContent = kbs(d.io.write);
+}
+
+function renderNetwork(n) {
+  const iface = n.primary;
+  $('net-iface').textContent = iface ? `${iface.name} · ${iface.address || ''}` : 'no active interface';
+  const rx = n.totalRx || 0;
+  const tx = n.totalTx || 0;
+  $('net-rx').innerHTML = `${kbs(rx).split(' ')[0]}<span> ${kbs(rx).split(' ')[1] || ''}</span>`;
+  $('net-tx').innerHTML = `${kbs(tx).split(' ')[0]}<span> ${kbs(tx).split(' ')[1] || ''}</span>`;
+  const denom = Math.max(rx, tx, 1024 * 50);
+  $('net-rx-bar').style.width = Math.min(100, (rx / denom) * 100) + '%';
+  $('net-tx-bar').style.width = Math.min(100, (tx / denom) * 100) + '%';
+  netSpark.push(rx / 1024, tx / 1024);
+  netSpark.setCeiling(Math.max(rx / 1024, tx / 1024, 100));
+
+  // connection detail panel
+  $('conn-iface').textContent = iface ? iface.name : '—';
+  const rows = [
+    ['Interface', iface ? iface.name : '—'],
+    ['IPv4 / Prefix', iface ? iface.cidr || iface.address || '—' : '—'],
+    ['MAC Address', iface && iface.mac ? iface.mac : '—'],
+    ['Media / Link', iface ? [iface.media, iface.linkSpeed].filter(Boolean).join(' · ') || '—' : '—'],
+    ['Wi-Fi Network', n.ssid || '—'],
+    ['LAN Gateway', n.gateway || '—'],
+    ['DNS Servers', n.dns && n.dns.length ? n.dns.join(', ') : '—'],
+    ['VPN Tunnels', n.tunnels && n.tunnels.count ? `${n.tunnels.count} active` : 'none'],
+    ['Total Received', iface ? bytes(iface.rxTotal) : '—'],
+    ['Total Sent', iface ? bytes(iface.txTotal) : '—'],
+  ];
+  $('conn-kv').innerHTML = rows.map(([k, v]) => `<dt>${esc(k)}</dt><dd>${esc(v)}</dd>`).join('');
+
+  // interfaces table — lo0 is excluded from the inventory (it is loopback)
+  const visible = n.interfaces.filter((i) => i.name !== 'lo0' || i.rxTotal > 0);
+  const tunnelNote = n.tunnels && n.tunnels.count ? ` · ${n.tunnels.count} tunnels aggregated` : '';
+  $('iface-count').textContent = `${visible.length} interfaces${tunnelNote}`;
+  $('iface-body').innerHTML = visible.length
+    ? visible
+        .map(
+          (i) => `<tr>
+        <td class="mono">${esc(i.name)}</td>
+        <td>${i.active ? '<span class="tag green">active</span>' : '<span class="tag">idle</span>'}</td>
+        <td class="mono">${esc(i.address || '—')}</td>
+        <td class="mono truncate" style="max-width:150px">${esc(i.ipv6 || '—')}</td>
+        <td class="mono">${esc(i.mac || '—')}</td>
+        <td class="right mono">${bytes(i.rxTotal)}</td>
+        <td class="right mono">${bytes(i.txTotal)}</td>
+      </tr>`
+        )
+        .join('')
+    : '<tr><td colspan="7" class="empty">no interfaces found</td></tr>';
+}
+
+function renderPing(p) {
+  $('ping-at').textContent = p.at ? clock(p.at) : '';
+  const pill = $('conn-pill');
+  pill.className = 'status-pill ' + (p.online ? 'online' : 'offline');
+  $('conn-text').textContent = p.online ? `online · ${p.best ? p.best.avg + 'ms' : ''}` : 'no internet';
+
+  $('ping-list').innerHTML = p.targets
+    .map((t) => {
+      const ms = t.avg;
+      const pct = ms == null ? 100 : Math.min(100, (ms / 200) * 100);
+      const col = ms == null ? '#ff6b81' : ms < 40 ? '#7ef0c0' : ms < 100 ? '#ffc46b' : '#ff6b81';
+      const detail = ms == null
+        ? 'unreachable'
+        : `${t.min}–${t.max} ms · jitter ${t.jitter == null ? '—' : t.jitter} ms`;
+      return `<div class="ping-row">
+      <span class="nm">${esc(t.name)}</span>
+      <span class="ms" style="color:${col}">${ms == null ? 'timeout' : ms.toFixed(1) + ' ms'}</span>
+      <span class="ping-bar"><i style="width:${pct}%;background:${col}"></i></span>
+      <span class="loss" title="${esc(detail)}">${t.loss > 0 ? t.loss + '% loss' : esc(detail.split(' · ')[0])}</span>
+    </div>`;
+    })
+    .join('');
+}
+
+function renderSpeed(s) {
+  if (!s) return;
+  $('speed-src').textContent = s.source || '';
+  const ceil = Math.max(s.download || 0, s.upload || 0, 100);
+  $('speed-down').innerHTML = `${(s.download || 0).toFixed(1)}<span> Mbps</span>`;
+  $('speed-up').innerHTML = `${(s.upload || 0).toFixed(1)}<span> Mbps</span>`;
+  $('speed-down-bar').style.width = Math.min(100, ((s.download || 0) / ceil) * 100) + '%';
+  $('speed-up-bar').style.width = Math.min(100, ((s.upload || 0) / ceil) * 100) + '%';
+  $('speed-note').textContent = `measured ${clock(s.at)} · ${s.duration}s sample via ${s.source}`;
+}
+
+function renderPorts(p) {
+  $('port-count').textContent = `${p.count} sockets · ${p.tcpCount || 0} TCP`;
+  $('port-body').innerHTML = p.ports.length
+    ? p.ports
+        .map(
+          (x) => `<tr>
+      <td class="mono" style="color:#e8eaf0;font-weight:600">${x.port}</td>
+      <td><span class="tag ${x.protocol === 'TCP' ? 'blue' : 'violet'}">${x.protocol}</span></td>
+      <td>${esc(x.command)}</td>
+      <td class="mono">${x.pid || '—'}</td>
+      <td class="mono truncate" style="max-width:130px">${esc(x.address)}</td>
+    </tr>`
+        )
+        .join('')
+    : '<tr><td colspan="5" class="empty">no listening sockets</td></tr>';
+}
+
+function procLabel(cmd) {
+  // Show the app name rather than a deep binary path; normalise macOS bundles.
+  let s = cmd;
+  const app = s.match(/\/([^/]+)\.app\/Contents\/MacOS\/([^\s]+)/);
+  if (app) {
+    const pretty = app[2].replace(/[-_]/g, ' ').replace(/Helper.*$/i, '').trim();
+    return pretty || app[1];
+  }
+  s = s.replace(/^\/\S+\//, '');            // strip leading dirs
+  s = s.replace(/^\/System\/Library\//, '');
+  return s.split(/\s+/)[0].slice(0, 42);
+}
+
+function renderProcs(p) {
+  lastProcData = p;
+  $('proc-count').textContent = `${p.total} running`;
+  const list = procTab === 'cpu' ? p.topCpu : p.topMem;
+
+  // Chrome/Electron spawn many identically-named helpers; disambiguate them
+  // with their PID so the list stays readable instead of repeating a name.
+  const nameCounts = {};
+  const labelled = list.map((x) => {
+    const base = procLabel(x.command);
+    nameCounts[base] = (nameCounts[base] || 0) + 1;
+    return { ...x, label: base, dup: false };
+  });
+  const seen = {};
+  for (const x of labelled) {
+    seen[x.label] = (seen[x.label] || 0) + 1;
+    if (nameCounts[x.label] > 1) {
+      x.label = `${x.label} #${seen[x.label]}`;
+      x.dup = true;
+    }
+  }
+
+  $('proc-body').innerHTML = labelled
+    .map(
+      (x) => `<tr>
+      <td class="mono">${x.pid}</td>
+      <td class="truncate" title="${esc(x.command)}">${esc(x.label)}</td>
+      <td class="right mono" style="color:${x.cpu > 50 ? '#ff6b81' : x.cpu > 15 ? '#ffc46b' : '#cfd3dd'}">${x.cpu.toFixed(1)}</td>
+      <td class="right mono">${x.mem.toFixed(1)}</td>
+      <td class="right mono">${bytes(x.rss)}</td>
+    </tr>`
+    )
+    .join('');
+}
+
+function renderDevices(d) {
+  $('dev-subnet').textContent = d.subnet ? `${d.count} devices · ${d.subnet}` : `${d.count} devices`;
+  $('dev-grid').innerHTML = d.devices.length
+    ? d.devices
+        .map((x) => {
+          const isSelf = d.self && x.ip === d.self;
+          const label = x.name || x.vendor || 'Unknown device';
+          const dot = x.isGateway ? '#7ef0c0' : isSelf ? '#b98cff' : '#6ea8fe';
+          return `<div class="dev fade-in">
+        <div class="top">
+          <span class="ip"><span class="dot" style="background:${dot};width:6px;height:6px"></span>${esc(x.ip)}</span>
+          ${x.isGateway ? '<span class="tag green">gateway</span>' : isSelf ? '<span class="tag violet">this mac</span>' : ''}
+        </div>
+        <div style="font-size:12px;color:#cfd3dd">${esc(label)}</div>
+        <div class="meta">${esc(x.mac)}${x.iface ? ' · ' + esc(x.iface) : ''}</div>
+      </div>`;
+        })
+        .join('')
+    : '<div class="empty">no devices discovered on the local network</div>';
+}
+
+/* ---------- loop ---------- */
+let failures = 0;
+
+async function tick(force) {
+  const e = document.getElementById('last-update-error');
+  try {
+    const snap = await API('/api/system');
+    renderSystem(snap.system, snap.uptimeServer);
+    renderCpu(snap.cpu);
+    renderMemory(snap.memory);
+    renderDisk(snap.disk);
+    renderNetwork(snap.network);
+    $('last-update').textContent = clock(snap.at);
+    failures = 0;
+  } catch (err) {
+    failures++;
+    const pill = $('conn-pill');
+    pill.className = 'status-pill offline';
+    $('conn-text').textContent = 'dashboard offline';
+  }
+}
+
+let slowBusy = false;
+async function tickSlow() {
+  if (slowBusy) return;
+  slowBusy = true;
+  try {
+    const [ports, procs, devices] = await Promise.all([API('/api/ports'), API('/api/processes'), API('/api/devices')]);
+    renderPorts(ports);
+    renderProcs(procs);
+    renderDevices(devices);
+  } catch (e) { /* keep last good render */ }
+  slowBusy = false;
+}
+
+async function refreshPing(force) {
+  try { renderPing(await API('/api/ping')); } catch (e) {}
+}
+
+/* ---------- controls ---------- */
+$('btn-refresh').addEventListener('click', () => { tick(true); tickSlow(); refreshPing(true); });
+
+$('btn-ping').addEventListener('click', async (ev) => {
+  const b = ev.currentTarget;
+  b.classList.add('busy');
+  await API('/api/health'); // nudge
+  try { renderPing(await API('/api/ping')); } catch (e) {}
+  b.classList.remove('busy');
+});
+
+$('btn-speed').addEventListener('click', async (ev) => {
+  const b = ev.currentTarget;
+  b.classList.add('busy');
+  const svg = b.querySelector('svg');
+  svg.classList.add('spin');
+  $('speed-note').textContent = 'running speed test… this takes ~15s';
+  try {
+    const s = await API('/api/speed');
+    renderSpeed(s);
+  } catch (e) {
+    $('speed-note').textContent = 'speed test failed — check your connection';
+  }
+  svg.classList.remove('spin');
+  b.classList.remove('busy');
+});
+
+$('proc-tabs').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('button[data-tab]');
+  if (!btn) return;
+  procTab = btn.dataset.tab;
+  [...$('proc-tabs').children].forEach((c) => c.className = c === btn ? 'primary' : '');
+  if (lastProcData) renderProcs(lastProcData);
+});
+
+/* ---------- boot ---------- */
+tick();
+tickSlow();
+refreshPing();
+setInterval(tick, 2000);
+setInterval(refreshPing, 15000);
+setInterval(tickSlow, 20000);
+</script>
+</body>
+</html>
