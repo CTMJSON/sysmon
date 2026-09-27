@@ -3,6 +3,9 @@
 A lightweight local system monitor. Type `system` in the terminal and the
 dashboard opens in a new Chrome tab on `http://127.0.0.1:7717`.
 
+<img width="3016" height="1646" alt="image" src="https://github.com/user-attachments/assets/34fd2c38-1c68-4a27-98b6-4acf50c14426" />
+
+
 No dependencies — plain Node + the native macOS tools (`vm_stat`, `df`,
 `netstat`, `lsof`, `ps`, `arp`, `ping`, `ifconfig`, `sysctl`, `route`,
 `pmset`, `ioreg`, `diskutil`, `nettop`, `dns-sd`).
